@@ -7,7 +7,6 @@ from PIL import Image, ImageTk
 import threading
 import sys
 import datetime
-import os
 
 class GVUSB2CaptureGUI:
     def __init__(self, root):
@@ -23,8 +22,10 @@ class GVUSB2CaptureGUI:
         self.preview_thread = None
         self.image_item = None
         self.current_output = None
-        self._stopping = False          # flag to avoid multiple stops
-        self._current_photo = None      # BUGFIX: keep a real reference to the live PhotoImage
+        self._stopping = False
+        self._is_closing = False        # Track if we are shutting down the app completely
+        self._is_rendering = False      # Prevent Tkinter event queue flooding
+        self._current_photo = None      
 
         # Check if FFmpeg is available
         try:
@@ -66,58 +67,41 @@ class GVUSB2CaptureGUI:
 
         cmd = [
             "ffmpeg", "-y",
-            # Video input
-            "-f", "dshow",
-            "-video_size", "720x480",
-            "-framerate", "29.97",
-            "-pixel_format", "yuyv422",
-            "-rtbufsize", "256M",
-            "-i", video_device,
-            # Audio input
-            "-f", "dshow",
-            "-guess_layout_max", "0",
-            "-ac", "2",
-            "-rtbufsize", "256M",
-            "-i", audio_device,
+            "-f", "dshow", "-video_size", "720x480", "-framerate", "29.97",
+            "-pixel_format", "yuyv422", "-rtbufsize", "256M", "-i", video_device,
+            "-f", "dshow", "-guess_layout_max", "0", "-ac", "2",
+            "-rtbufsize", "256M", "-i", audio_device,
             # Recording output
             "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "mpeg2video",
-            "-b:v", "15000k",
-            "-minrate", "15000k",
-            "-maxrate", "15000k",
-            "-bufsize", "3000k",
-            "-profile:v", "main",
-            "-level:v", "main",
-            "-g", "15",
-            "-flags", "+ilme+ildct", "-aspect", "4:3", "-pix_fmt", "yuv420p",
-            "-vf", r"select=gte(n\,2),setfield=tff",
-            "-fps_mode", "cfr",
+            "-c:v", "mpeg2video", "-b:v", "15000k", "-minrate", "15000k",
+            "-maxrate", "15000k", "-bufsize", "3000k", "-profile:v", "main",
+            "-level:v", "main", "-g", "15", "-flags", "+ilme+ildct",
+            "-aspect", "4:3", "-pix_fmt", "yuv420p",
+            "-vf", r"select=gte(n\,2),setfield=tff", "-fps_mode", "cfr",
             "-af", r"adelay=200|200,aselect=gte(n\,2),aresample=async=1",
-            "-ar", "48000",
-            "-c:a", "mp2", "-b:a", "320k",
-            "-f", "vob",
-            self.current_output,
+            "-ar", "48000", "-c:a", "mp2", "-b:a", "320k",
+            "-f", "vob", self.current_output,
             # Preview output (MJPEG pipe)
-            "-map", "0:v:0",
-            "-c:v", "mjpeg",
-            "-q:v", "2",
-            "-f", "image2pipe",
-            "pipe:1"
+            "-map", "0:v:0", "-c:v", "mjpeg", "-q:v", "2",
+            "-f", "image2pipe", "pipe:1"
         ]
 
-        CREATE_NO_WINDOW = 0x08000000
+        kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": sys.stderr,
+            "bufsize": 10**7
+        }
+        
+        # Safely handle creationflags for Windows only
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000
 
         try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=sys.stderr,
-                bufsize=10**7,
-                creationflags=CREATE_NO_WINDOW
-            )
+            self.process = subprocess.Popen(cmd, **kwargs)
             self.running = True
             self._stopping = False
+            self._is_closing = False
             self.status_label.config(text=f"Status: RECORDING ({self.current_output})...", fg="#2ecc71")
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
@@ -141,14 +125,12 @@ class GVUSB2CaptureGUI:
             try:
                 chunk = proc.stdout.read(4096)
                 if not chunk:
-                    if proc.poll() is not None:
-                        break  # FFmpeg exited cleanly, break loop
-                    continue
+                    # Pipe EOF reached; ffmpeg exited or pipeline closed. 
+                    break 
 
                 buffer.extend(chunk)
 
                 if len(buffer) > MAX_BUFFER_SIZE:
-                    # Find last complete frame and keep only that portion
                     last_start = buffer.rfind(b'\xff\xd8')
                     if last_start != -1:
                         buffer = buffer[last_start:]
@@ -156,7 +138,6 @@ class GVUSB2CaptureGUI:
                         buffer.clear()
                     continue
 
-                # Process all complete JPEG frames in the buffer
                 while True:
                     start = buffer.find(b'\xff\xd8')
                     if start == -1:
@@ -170,11 +151,16 @@ class GVUSB2CaptureGUI:
 
                     np_arr = np.frombuffer(jpg_data, dtype=np.uint8)
                     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                    
                     if frame is not None:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         img = Image.fromarray(rgb)
-                        photo = ImageTk.PhotoImage(image=img)
-                        self.root.after(0, self.update_canvas, photo)
+                        
+                        # Prevent Event queue flooding by dropping frames if Tkinter is busy
+                        if not self._is_rendering:
+                            self._is_rendering = True
+                            # Pass the PIL Image, NOT the PhotoImage, to Tkinter thread safely
+                            self.root.after(0, self.update_canvas, img)
 
             except (BrokenPipeError, OSError):
                 break
@@ -183,22 +169,31 @@ class GVUSB2CaptureGUI:
                 traceback.print_exc()
                 break
                 
-        # Properly flag the thread as stopped once the loop breaks
         self.running = False
 
-    def update_canvas(self, photo):
-        # Ensure the canvas hasn't been destroyed by app closure
-        if self.running and self.canvas.winfo_exists():
-            self._current_photo = photo
-            if self.image_item is None:
-                self.image_item = self.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-            else:
-                self.canvas.itemconfig(self.image_item, image=photo)
+    def update_canvas(self, img):
+        try:
+            # Wrap in try/except in case window is closing and widget is invalid
+            if self.running and self.canvas.winfo_exists():
+                # Creation of ImageTk.PhotoImage MUST happen on the Tkinter main thread
+                photo = ImageTk.PhotoImage(image=img)
+                self._current_photo = photo
+                
+                if self.image_item is None:
+                    self.image_item = self.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+                else:
+                    self.canvas.itemconfig(self.image_item, image=photo)
+        except tk.TclError:
+            pass
+        finally:
+            self._is_rendering = False
 
-    def stop_capture(self):
+    def stop_capture(self, is_closing=False):
         if not self.running or self._stopping:
             return
+            
         self._stopping = True
+        self._is_closing = is_closing
         self.status_label.config(text="Status: Stopping stream capture...", fg="#f39c12")
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.DISABLED)
@@ -206,7 +201,6 @@ class GVUSB2CaptureGUI:
         def async_teardown():
             proc = self.process
             if proc:
-                # 1. Ask FFmpeg to quit gracefully by sending 'q' + newline.
                 if proc.stdin:
                     try:
                         proc.stdin.write(b'q\n')
@@ -214,8 +208,6 @@ class GVUSB2CaptureGUI:
                     except (BrokenPipeError, OSError):
                         pass
 
-                # 2. Wait for FFmpeg to exit. When it does, stdout reaches EOF
-                #    and the preview thread's read() returns b'' -> loop breaks.
                 try:
                     proc.wait(timeout=4)
                 except subprocess.TimeoutExpired:
@@ -226,33 +218,32 @@ class GVUSB2CaptureGUI:
                         proc.kill()
                         proc.wait()
                 except Exception:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
+                    pass
 
-                # 3. Close pipes safely.
                 for pipe in [proc.stdout, proc.stdin]:
                     if pipe:
                         try:
                             pipe.close()
                         except Exception:
                             pass
+                            
                 self.process = None
 
-            # 4. Make sure the preview thread has actually exited before we
-            #    tell the GUI we are done. Without this, finalize_stop() could
-            #    clear the canvas while a stale after() callback is still queued.
             if self.preview_thread and self.preview_thread.is_alive():
                 self.preview_thread.join(timeout=2)
 
-            # 5. Notify GUI after cleanup (only if the window is still alive).
-            if self.root.winfo_exists():
-                self.root.after(0, self.finalize_stop)
+            # Schedule UI update safely on main thread
+            self.root.after(0, self.safe_finalize_stop)
 
         threading.Thread(target=async_teardown, daemon=True).start()
+
+    def safe_finalize_stop(self):
+        # Wrapper to safely check if window still exists (run on main thread)
+        try:
+            if self.root.winfo_exists():
+                self.finalize_stop()
+        except tk.TclError:
+            pass
 
     def finalize_stop(self):
         self.canvas.delete("all")
@@ -262,25 +253,25 @@ class GVUSB2CaptureGUI:
         self.start_btn.config(state=tk.NORMAL)
         self._stopping = False
 
-        filename = self.current_output if self.current_output else "output.mpg"
-        # Show message box only if the root window still exists
-        if self.root.winfo_exists():
+        # Only pop up the success messagebox if the user manually hit "Stop"
+        if not self._is_closing:
+            filename = self.current_output if self.current_output else "output.mpg"
             messagebox.showinfo("Success", f"Recording finished completely!\nYour file '{filename}' is ready.")
 
     def on_closing(self):
         if self.running:
             if messagebox.askokcancel("Quit", "A recording is in progress.\nDo you want to stop recording and exit?"):
-                self.stop_capture()
+                self.stop_capture(is_closing=True)
                 self.wait_for_shutdown()
         else:
             self.root.destroy()
 
     def wait_for_shutdown(self):
-        if self.process is not None and self.root.winfo_exists():
+        # Gracefully wait until async_teardown clears the process
+        if self.process is not None:
             self.root.after(100, self.wait_for_shutdown)
         else:
-            # Give finalize_stop a moment to show the message box before destroying
-            self.root.after(300, self.root.destroy)
+            self.root.destroy()
 
 if __name__ == "__main__":
     root = tk.Tk()
