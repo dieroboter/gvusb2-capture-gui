@@ -3,7 +3,7 @@ capture interlaced mpgs using the i-o data gv-usb2 capture card at a better qual
 
 ## instructions
 1. install ffmpeg with ``winget install ffmpeg``
-2. install the required libraries with ``pip install opencv-python numpy Pillow``
+2. install the required libraries with ``python -m pip install opencv-python numpy Pillow``
 3. run the script with with ``python capture.py``
 
 ## notes
