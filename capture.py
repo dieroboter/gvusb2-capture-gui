@@ -7,6 +7,106 @@ from PIL import Image, ImageTk
 import threading
 import sys
 import datetime
+import re
+
+REQUIRED_VIDEO_DEVICE = "GV-USB2, Analog Capture"
+REQUIRED_AUDIO_DEVICE = "GV-USB2, Analog WaveIn"
+
+
+def verify_dshow_devices():
+    """Checks for FFmpeg and verifies that the specified DirectShow devices exist."""
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "ignore"
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            **kwargs
+        )
+        output = proc.stderr
+    except FileNotFoundError:
+        err_msg = "Error: FFmpeg is not installed or not found in system PATH."
+        if sys.stderr:
+            sys.stderr.write(err_msg + "\n")
+        else:
+            # Fallback popup if run via pythonw with no console
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            messagebox.showerror("FFmpeg Missing", err_msg)
+            temp_root.destroy()
+        sys.exit(1)
+    except Exception as e:
+        err_msg = f"Error checking DirectShow devices: {e}"
+        if sys.stderr:
+            sys.stderr.write(err_msg + "\n")
+        sys.exit(1)
+
+    video_devices = []
+    audio_devices = []
+    current_section = None
+
+    for line in output.splitlines():
+        if "DirectShow video devices" in line:
+            current_section = "video"
+            continue
+        elif "DirectShow audio devices" in line:
+            current_section = "audio"
+            continue
+
+        if current_section and "Alternative name" not in line:
+            match = re.search(r'"([^"]+)"', line)
+            if match:
+                dev_name = match.group(1)
+                if current_section == "video":
+                    video_devices.append(dev_name)
+                elif current_section == "audio":
+                    audio_devices.append(dev_name)
+
+    missing = []
+    if REQUIRED_VIDEO_DEVICE not in video_devices:
+        missing.append(f"Required video device not found: '{REQUIRED_VIDEO_DEVICE}'")
+    if REQUIRED_AUDIO_DEVICE not in audio_devices:
+        missing.append(f"Required audio device not found: '{REQUIRED_AUDIO_DEVICE}'")
+
+    if missing:
+        lines = ["=== DirectShow Device Verification Error ==="]
+        for err in missing:
+            lines.append(f" [!] {err}")
+
+        lines.append("\nDetected Video Devices:")
+        if video_devices:
+            for v in video_devices:
+                lines.append(f"  - {v}")
+        else:
+            lines.append("  (No video devices detected)")
+
+        lines.append("\nDetected Audio Devices:")
+        if audio_devices:
+            for a in audio_devices:
+                lines.append(f"  - {a}")
+        else:
+            lines.append("  (No audio devices detected)")
+
+        lines.append("=============================================")
+        full_err_msg = "\n".join(lines)
+
+        if sys.stderr:
+            sys.stderr.write(full_err_msg + "\n")
+        else:
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            messagebox.showerror("Devices Not Found", full_err_msg)
+            temp_root.destroy()
+
+        sys.exit(1)
+
 
 class GVUSB2CaptureGUI:
     def __init__(self, root):
@@ -23,16 +123,9 @@ class GVUSB2CaptureGUI:
         self.image_item = None
         self.current_output = None
         self._stopping = False
-        self._is_closing = False        # Track if we are shutting down the app completely
-        self._is_rendering = False      # Prevent Tkinter event queue flooding
-        self._current_photo = None      
-
-        # Check if FFmpeg is available
-        try:
-            subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-        except (subprocess.SubprocessError, FileNotFoundError):
-            messagebox.showerror("FFmpeg not found", "Please install FFmpeg and add it to your PATH.")
-            sys.exit(1)
+        self._is_closing = False
+        self._is_rendering = False
+        self._current_photo = None
 
         self.status_label = tk.Label(root, text="Status: Ready", font=("Arial", 12, "bold"))
         self.status_label.pack(pady=10)
@@ -61,9 +154,8 @@ class GVUSB2CaptureGUI:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_output = f"capture_{timestamp}.mpg"
 
-        # Use explicit device names – change these if needed
-        video_device = "video=GV-USB2, Analog Capture"
-        audio_device = "audio=GV-USB2, Analog WaveIn"
+        video_device = f"video={REQUIRED_VIDEO_DEVICE}"
+        audio_device = f"audio={REQUIRED_AUDIO_DEVICE}"
 
         cmd = [
             "ffmpeg", "-y",
@@ -89,11 +181,10 @@ class GVUSB2CaptureGUI:
         kwargs = {
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
-            "stderr": sys.stderr,
+            "stderr": sys.stderr if sys.stderr is not None else subprocess.DEVNULL,
             "bufsize": 10**7
         }
         
-        # Safely handle creationflags for Windows only
         if sys.platform == "win32":
             kwargs["creationflags"] = 0x08000000
 
@@ -156,10 +247,8 @@ class GVUSB2CaptureGUI:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         img = Image.fromarray(rgb)
                         
-                        # Prevent Event queue flooding by dropping frames if Tkinter is busy
                         if not self._is_rendering:
                             self._is_rendering = True
-                            # Pass the PIL Image, NOT the PhotoImage, to Tkinter thread safely
                             self.root.after(0, self.update_canvas, img)
 
             except (BrokenPipeError, OSError):
@@ -169,13 +258,18 @@ class GVUSB2CaptureGUI:
                 traceback.print_exc()
                 break
                 
-        self.running = False
+        # If the stream exited abnormally without stop_capture being triggered
+        if not self._stopping and self.process is not None:
+            self.root.after(0, self.handle_unexpected_exit)
+
+    def handle_unexpected_exit(self):
+        """Recovers GUI state when FFmpeg terminates unexpectedly."""
+        self.stop_capture()
+        messagebox.showwarning("Stream Interrupted", "FFmpeg process ended unexpectedly or device was disconnected.")
 
     def update_canvas(self, img):
         try:
-            # Wrap in try/except in case window is closing and widget is invalid
             if self.running and self.canvas.winfo_exists():
-                # Creation of ImageTk.PhotoImage MUST happen on the Tkinter main thread
                 photo = ImageTk.PhotoImage(image=img)
                 self._current_photo = photo
                 
@@ -189,10 +283,12 @@ class GVUSB2CaptureGUI:
             self._is_rendering = False
 
     def stop_capture(self, is_closing=False):
-        if not self.running or self._stopping:
+        # Allow cleanup if process exists even if running is already False
+        if (not self.running and self.process is None) or self._stopping:
             return
             
         self._stopping = True
+        self.running = False
         self._is_closing = is_closing
         self.status_label.config(text="Status: Stopping stream capture...", fg="#f39c12")
         self.start_btn.config(state=tk.DISABLED)
@@ -232,13 +328,11 @@ class GVUSB2CaptureGUI:
             if self.preview_thread and self.preview_thread.is_alive():
                 self.preview_thread.join(timeout=2)
 
-            # Schedule UI update safely on main thread
             self.root.after(0, self.safe_finalize_stop)
 
         threading.Thread(target=async_teardown, daemon=True).start()
 
     def safe_finalize_stop(self):
-        # Wrapper to safely check if window still exists (run on main thread)
         try:
             if self.root.winfo_exists():
                 self.finalize_stop()
@@ -253,13 +347,15 @@ class GVUSB2CaptureGUI:
         self.start_btn.config(state=tk.NORMAL)
         self._stopping = False
 
-        # Only pop up the success messagebox if the user manually hit "Stop"
         if not self._is_closing:
             filename = self.current_output if self.current_output else "output.mpg"
             messagebox.showinfo("Success", f"Recording finished completely!\nYour file '{filename}' is ready.")
 
     def on_closing(self):
-        if self.running:
+        if self.running or self._stopping or self.process is not None:
+            if self._stopping:
+                self.wait_for_shutdown()
+                return
             if messagebox.askokcancel("Quit", "A recording is in progress.\nDo you want to stop recording and exit?"):
                 self.stop_capture(is_closing=True)
                 self.wait_for_shutdown()
@@ -267,13 +363,15 @@ class GVUSB2CaptureGUI:
             self.root.destroy()
 
     def wait_for_shutdown(self):
-        # Gracefully wait until async_teardown clears the process
-        if self.process is not None:
+        if self.process is not None or self._stopping:
             self.root.after(100, self.wait_for_shutdown)
         else:
             self.root.destroy()
 
+
 if __name__ == "__main__":
+    verify_dshow_devices()
+
     root = tk.Tk()
     app = GVUSB2CaptureGUI(root)
     root.mainloop()
