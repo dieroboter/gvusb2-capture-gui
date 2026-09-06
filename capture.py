@@ -32,20 +32,12 @@ def verify_dshow_devices():
         )
         output = proc.stderr
     except FileNotFoundError:
-        err_msg = "Error: FFmpeg is not installed or not found in system PATH."
         if sys.stderr:
-            sys.stderr.write(err_msg + "\n")
-        else:
-            # Fallback popup if run via pythonw with no console
-            temp_root = tk.Tk()
-            temp_root.withdraw()
-            messagebox.showerror("FFmpeg Missing", err_msg)
-            temp_root.destroy()
+            sys.stderr.write("Error: FFmpeg is not installed or not found in system PATH.\n")
         sys.exit(1)
     except Exception as e:
-        err_msg = f"Error checking DirectShow devices: {e}"
         if sys.stderr:
-            sys.stderr.write(err_msg + "\n")
+            sys.stderr.write(f"Error querying DirectShow devices: {e}\n")
         sys.exit(1)
 
     video_devices = []
@@ -99,11 +91,7 @@ def verify_dshow_devices():
 
         if sys.stderr:
             sys.stderr.write(full_err_msg + "\n")
-        else:
-            temp_root = tk.Tk()
-            temp_root.withdraw()
-            messagebox.showerror("Devices Not Found", full_err_msg)
-            temp_root.destroy()
+            sys.stderr.flush()
 
         sys.exit(1)
 
@@ -125,6 +113,7 @@ class GVUSB2CaptureGUI:
         self._stopping = False
         self._is_closing = False
         self._is_rendering = False
+        self._had_error = False
         self._current_photo = None
 
         self.status_label = tk.Label(root, text="Status: Ready", font=("Arial", 12, "bold"))
@@ -153,6 +142,7 @@ class GVUSB2CaptureGUI:
     def start_capture(self):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_output = f"capture_{timestamp}.mpg"
+        self._had_error = False
 
         video_device = f"video={REQUIRED_VIDEO_DEVICE}"
         audio_device = f"audio={REQUIRED_AUDIO_DEVICE}"
@@ -173,8 +163,8 @@ class GVUSB2CaptureGUI:
             "-af", r"adelay=200|200,aselect=gte(n\,2),aresample=async=1",
             "-ar", "48000", "-c:a", "mp2", "-b:a", "320k",
             "-f", "vob", self.current_output,
-            # Preview output (MJPEG pipe)
-            "-map", "0:v:0", "-c:v", "mjpeg", "-q:v", "2",
+            # Preview output (MJPEG pipe, video only)
+            "-map", "0:v:0", "-an", "-c:v", "mjpeg", "-q:v", "2",
             "-f", "image2pipe", "pipe:1"
         ]
 
@@ -184,7 +174,7 @@ class GVUSB2CaptureGUI:
             "stderr": sys.stderr if sys.stderr is not None else subprocess.DEVNULL,
             "bufsize": 10**7
         }
-        
+
         if sys.platform == "win32":
             kwargs["creationflags"] = 0x08000000
 
@@ -206,7 +196,7 @@ class GVUSB2CaptureGUI:
 
     def read_pipe_stream(self):
         buffer = bytearray()
-        MAX_BUFFER_SIZE = 20 * 1024 * 1024 
+        MAX_BUFFER_SIZE = 20 * 1024 * 1024
 
         while self.running:
             proc = self.process
@@ -214,10 +204,9 @@ class GVUSB2CaptureGUI:
                 break
 
             try:
-                chunk = proc.stdout.read(4096)
+                chunk = proc.stdout.read(65536)
                 if not chunk:
-                    # Pipe EOF reached; ffmpeg exited or pipeline closed. 
-                    break 
+                    break
 
                 buffer.extend(chunk)
 
@@ -232,21 +221,27 @@ class GVUSB2CaptureGUI:
                 while True:
                     start = buffer.find(b'\xff\xd8')
                     if start == -1:
+                        buffer.clear()
                         break
+
+                    if start > 0:
+                        del buffer[:start]
+                        start = 0
+
                     end = buffer.find(b'\xff\xd9', start + 2)
                     if end == -1:
                         break
 
-                    jpg_data = buffer[start:end+2]
-                    del buffer[:end+2]
+                    jpg_data = buffer[start:end + 2]
+                    del buffer[:end + 2]
 
                     np_arr = np.frombuffer(jpg_data, dtype=np.uint8)
                     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                    
+
                     if frame is not None:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         img = Image.fromarray(rgb)
-                        
+
                         if not self._is_rendering:
                             self._is_rendering = True
                             self.root.after(0, self.update_canvas, img)
@@ -254,25 +249,23 @@ class GVUSB2CaptureGUI:
             except (BrokenPipeError, OSError):
                 break
             except Exception:
-                import traceback
-                traceback.print_exc()
                 break
-                
-        # If the stream exited abnormally without stop_capture being triggered
+
         if not self._stopping and self.process is not None:
+            self._had_error = True
             self.root.after(0, self.handle_unexpected_exit)
 
     def handle_unexpected_exit(self):
         """Recovers GUI state when FFmpeg terminates unexpectedly."""
-        self.stop_capture()
         messagebox.showwarning("Stream Interrupted", "FFmpeg process ended unexpectedly or device was disconnected.")
+        self.stop_capture()
 
     def update_canvas(self, img):
         try:
             if self.running and self.canvas.winfo_exists():
                 photo = ImageTk.PhotoImage(image=img)
                 self._current_photo = photo
-                
+
                 if self.image_item is None:
                     self.image_item = self.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
                 else:
@@ -283,10 +276,9 @@ class GVUSB2CaptureGUI:
             self._is_rendering = False
 
     def stop_capture(self, is_closing=False):
-        # Allow cleanup if process exists even if running is already False
         if (not self.running and self.process is None) or self._stopping:
             return
-            
+
         self._stopping = True
         self.running = False
         self._is_closing = is_closing
@@ -322,7 +314,7 @@ class GVUSB2CaptureGUI:
                             pipe.close()
                         except Exception:
                             pass
-                            
+
                 self.process = None
 
             if self.preview_thread and self.preview_thread.is_alive():
@@ -343,13 +335,16 @@ class GVUSB2CaptureGUI:
         self.canvas.delete("all")
         self.image_item = None
         self._current_photo = None
-        self.status_label.config(text="Status: Finished / Ready", fg="black")
         self.start_btn.config(state=tk.NORMAL)
         self._stopping = False
 
-        if not self._is_closing:
-            filename = self.current_output if self.current_output else "output.mpg"
-            messagebox.showinfo("Success", f"Recording finished completely!\nYour file '{filename}' is ready.")
+        if self._had_error:
+            self.status_label.config(text="Status: Stopped with Error / Interrupted", fg="#e74c3c")
+        else:
+            self.status_label.config(text="Status: Finished / Ready", fg="black")
+            if not self._is_closing:
+                filename = self.current_output if self.current_output else "output.mpg"
+                messagebox.showinfo("Success", f"Recording finished completely!\nYour file '{filename}' is ready.")
 
     def on_closing(self):
         if self.running or self._stopping or self.process is not None:
