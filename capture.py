@@ -30,7 +30,7 @@ PREVIEW_FRAME_SIZE = PREVIEW_WIDTH * PREVIEW_HEIGHT * 3  # RGB24 (921,600 bytes)
 # Native Windows Live Audio Playback Engine
 # ==========================================
 WAVE_FORMAT_PCM = 1
-WAVE_MAPPER = -1
+WAVE_MAPPER = 0xFFFFFFFF  # (UINT)-1 in Win32 SDK
 WHDR_DONE = 0x00000001
 WHDR_PREPARED = 0x00000002
 
@@ -112,7 +112,7 @@ class WindowsLiveAudioPlayer:
 
     def write_chunk(self, data):
         with self._lock:
-            if not self.running or not self.hWaveOut.value:
+            if not self.running or not self.hWaveOut:
                 return
 
             hdr = self.buffers[self.cur_buf_idx]
@@ -123,7 +123,11 @@ class WindowsLiveAudioPlayer:
                     break
                 time.sleep(0.002)
 
-            if (hdr.dwFlags & WHDR_DONE) and (hdr.dwFlags & WHDR_PREPARED):
+            # Drop chunk if device buffer is still busy to avoid driver corruptions
+            if not (hdr.dwFlags & WHDR_DONE):
+                return
+
+            if hdr.dwFlags & WHDR_PREPARED:
                 self.winmm.waveOutUnprepareHeader(self.hWaveOut, ctypes.byref(hdr), ctypes.sizeof(WAVEHDR))
 
             chunk_len = min(len(data), self.buffer_size)
@@ -139,7 +143,7 @@ class WindowsLiveAudioPlayer:
     def stop(self):
         with self._lock:
             self.running = False
-            if self.winmm and self.hWaveOut.value:
+            if self.winmm and self.hWaveOut:
                 self.winmm.waveOutReset(self.hWaveOut)
                 for hdr in self.buffers:
                     if hdr.dwFlags & WHDR_PREPARED:
@@ -345,26 +349,38 @@ class GVUSB2CaptureGUI:
             self.root.after(0, self.on_devices_ready)
 
     def on_ffmpeg_not_found(self):
-        if not self.root.winfo_exists():
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
             return
         self.status_label.config(text="Status: FFmpeg not found in PATH", fg="#e74c3c")
         messagebox.showerror("Error", "FFmpeg is not installed or not found in system PATH.")
 
     def on_device_check_failed(self, err_msg):
-        if not self.root.winfo_exists():
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
             return
         self.status_label.config(text="Status: Error detecting devices", fg="#e74c3c")
         messagebox.showerror("Error", f"Error querying DirectShow devices:\n{err_msg}")
 
     def on_required_devices_missing(self, missing, video_devices, audio_devices):
-        if not self.root.winfo_exists():
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
             return
         self.status_label.config(text="Status: Required capture device not connected", fg="#e74c3c")
         err_msg = "\n".join(missing) + "\n\nPlease connect your I-O Data GV-USB2 adapter and restart."
         messagebox.showwarning("Device Not Found", err_msg)
 
     def on_devices_ready(self):
-        if not self.root.winfo_exists():
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
             return
         self.status_label.config(text="Status: Ready", fg="black")
         self.start_btn.config(state=tk.NORMAL)
@@ -429,12 +445,15 @@ class GVUSB2CaptureGUI:
             "[prev_a_in]aresample=async=1[out_prev_a]",
             # 1. Main Recording output (Multi-threaded MPEG-2 encoder)
             "-map", "[out_rec_v]", "-map", "[out_rec_a]",
-            "-c:v", "mpeg2video", "-b:v", "15000k", "-minrate", "8000k",
-            "-maxrate", "15000k", "-bufsize", "1835k*8", "-profile:v", "main",
-            "-level:v", "main", "-g", "15", "-flags", "+ilme+ildct",
+            "-c:v", "mpeg2video",
+            "-b:v", "8000k", "-maxrate", "9000k", "-bufsize", "1835k",
+            "-profile:v", "main", "-level:v", "main",
+            "-g", "15", "-bf", "2",
+            "-flags", "+ilme+ildct",
+            "-trellis", "1",
             "-aspect", "4:3", "-pix_fmt", "yuv420p", "-fps_mode", "cfr",
             "-threads", "0",
-            "-ar", "48000", "-c:a", "ac3", "-b:a", "384k",
+            "-ar", "48000", "-c:a", "ac3", "-b:a", "256k",
             "-f", "vob", self._temp_output,
             # 2. Video Preview output (Zero-conversion raw pipe)
             "-map", "[out_prev_v]", "-an",
@@ -505,6 +524,7 @@ class GVUSB2CaptureGUI:
             sock.close()
         except Exception:
             pass
+        self._audio_sock = None
         self.audio_player.stop()
 
     def _pipe_reader_worker(self):
@@ -542,7 +562,10 @@ class GVUSB2CaptureGUI:
 
     def _render_frame(self):
         """In-place buffer update on persistent PhotoImage (no GDI recreation)."""
-        if not self.running or not self.canvas.winfo_exists():
+        try:
+            if not self.running or not self.canvas.winfo_exists():
+                return
+        except tk.TclError:
             return
 
         frame_data = None
@@ -566,6 +589,8 @@ class GVUSB2CaptureGUI:
                 pass
 
     def handle_unexpected_exit(self):
+        if self._stopping:
+            return
         messagebox.showwarning("Stream Interrupted", "FFmpeg process ended unexpectedly or device was disconnected.")
         self.stop_capture()
 
@@ -587,6 +612,7 @@ class GVUSB2CaptureGUI:
                     try:
                         proc.stdin.write(b'q\n')
                         proc.stdin.flush()
+                        proc.stdin.close()
                     except (BrokenPipeError, OSError):
                         pass
 
@@ -657,15 +683,13 @@ class GVUSB2CaptureGUI:
                             if trim_proc.returncode == 0 and os.path.exists(self.current_output) and os.path.getsize(self.current_output) > 0:
                                 safe_remove_file(self._temp_output)
                             else:
-                                if os.path.exists(self.current_output):
-                                    safe_remove_file(self.current_output)
-                                os.rename(self._temp_output, self.current_output)
+                                os.replace(self._temp_output, self.current_output)
                         else:
-                            os.rename(self._temp_output, self.current_output)
+                            os.replace(self._temp_output, self.current_output)
 
                     except Exception:
-                        if os.path.exists(self._temp_output) and not os.path.exists(self.current_output):
-                            os.rename(self._temp_output, self.current_output)
+                        if os.path.exists(self._temp_output):
+                            os.replace(self._temp_output, self.current_output)
                 else:
                     safe_remove_file(self._temp_output)
 
@@ -689,6 +713,7 @@ class GVUSB2CaptureGUI:
             self._frame_queue.clear()
 
         self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
         self._stopping = False
 
         if self._had_error:
@@ -716,7 +741,10 @@ class GVUSB2CaptureGUI:
             self.root.after(100, self.wait_for_shutdown)
         else:
             self.audio_player.stop()
-            self.root.destroy()
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass
 
 
 if __name__ == "__main__":
