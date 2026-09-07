@@ -453,7 +453,7 @@ class GVUSB2CaptureGUI:
             "-trellis", "1",
             "-aspect", "4:3", "-pix_fmt", "yuv420p", "-fps_mode", "cfr",
             "-threads", "0",
-            "-ar", "48000", "-c:a", "ac3", "-b:a", "256k",
+            "-ar", "48000", "-c:a", "ac3", "-b:a", "384k",
             "-f", "vob", self._temp_output,
             # 2. Video Preview output (Zero-conversion raw pipe)
             "-map", "[out_prev_v]", "-an",
