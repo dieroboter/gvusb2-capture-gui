@@ -25,6 +25,10 @@ PREVIEW_WIDTH = 640
 PREVIEW_HEIGHT = 480
 PREVIEW_FRAME_SIZE = PREVIEW_WIDTH * PREVIEW_HEIGHT * 3  # RGB24 (921,600 bytes)
 
+# Video / Audio Sync Offset (in seconds)
+# Adjusted by +0.13831s (0.5005 + 0.13831 = 0.63881s) to eliminate audio desync without inserting leading silence.
+AUDIO_TRIM_START = 0.63881
+
 
 # ==========================================
 # Native Windows Live Audio Playback Engine
@@ -441,7 +445,7 @@ class GVUSB2CaptureGUI:
             r"[rec_v]select=gte(n\,30),setpts=PTS-STARTPTS,setfield=tff[out_rec_v];"
             f"[prev_v]field=top,scale={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:flags=fast_bilinear,format=rgb24[out_prev_v];"
             "[1:a]asplit=2[rec_a_in][prev_a_in];"
-            "[rec_a_in]atrim=start=0.5005,asetpts=PTS-STARTPTS,aresample=async=1,afade=t=in:st=0:d=0.040[out_rec_a];"
+            f"[rec_a_in]atrim=start={AUDIO_TRIM_START:.5f},asetpts=PTS-STARTPTS,aresample=async=1,afade=t=in:st=0:d=0.040[out_rec_a];"
             "[prev_a_in]aresample=async=1[out_prev_a]",
             # 1. Main Recording output (Multi-threaded MPEG-2 encoder)
             "-map", "[out_rec_v]", "-map", "[out_rec_a]",
