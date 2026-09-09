@@ -43,7 +43,7 @@ def verify_devices():
 
     missing = [f"• {k} Device: '{n}'" for k, n, d in (("Video", REQ_VID, v_devs), ("Audio", REQ_AUD, a_devs)) if n not in d]
     if missing:
-        return False, "The required inputs weren't found:\n\n" + "\n".join(missing) + "\n\nPlease I-O Data GV-USB2 and try again."
+        return False, "The required inputs weren't found:\n\n" + "\n".join(missing) + "\n\nPlease connect the I-O Data GV-USB2 and try again."
     return True, ""
 
 
@@ -221,21 +221,30 @@ class DVDRecorderGUI:
 
         cmd = [
             "ffmpeg", "-y", "-fflags", "nobuffer", "-thread_queue_size", "1024",
-            "-f", "dshow", "-video_size", f"{CAP_W}x{CAP_H}", "-framerate", "29.97", "-pixel_format", "yuyv422", "-rtbufsize", "256M", "-i", f"video={REQ_VID}",
-            "-thread_queue_size", "1024", "-f", "dshow", "-guess_layout_max", "0", "-ac", "2", "-rtbufsize", "256M", "-i", f"audio={REQ_AUD}",
+            "-f", "dshow", "-video_size", f"{CAP_W}x{CAP_H}", "-framerate", "29.97",
+            "-pixel_format", "yuyv422", "-rtbufsize", "256M", "-i", f"video={REQ_VID}",
+            "-thread_queue_size", "1024", "-f", "dshow", "-guess_layout_max", "0",
+            "-ac", "2", "-rtbufsize", "256M", "-i", f"audio={REQ_AUD}",
             "-filter_complex", (
-                f"[0:v]split=2[rec_v][prev_v];[rec_v]setfield=tff[out_rec_v];"
+                f"[0:v]split=2[rec_v][prev_v];"
+                f"[rec_v]setfield=tff,hqdn3d=1.5:1.5:3:3[out_rec_v];"
                 f"[prev_v]setfield=tff,bwdif=mode=0:parity=0:deint=0,scale={PREV_W}:{PREV_H}:flags=fast_bilinear,format=rgb24[out_prev_v];"
                 f"[1:a]asplit=2[rec_a_in][prev_a_in];"
                 f"[rec_a_in]{rec_aud_f}[out_rec_a];"
                 f"[prev_a_in]{prev_aud_f}[out_prev_a]"
             ),
-            "-map", "[out_prev_v]", "-an", "-c:v", "rawvideo", "-pix_fmt", "rgb24", "-fps_mode", "passthrough", "-flush_packets", "1", "-f", "rawvideo", "pipe:1",
-            "-map", "[out_prev_a]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", "-flush_packets", "1", "-f", "s16le", f"tcp://127.0.0.1:{prev_port}",
-            "-map", "[out_rec_v]", "-map", "[out_rec_a]", "-c:v", "mpeg2video", "-b:v", "8000k", "-maxrate", "9000k", "-bufsize", "1835k",
-            "-profile:v", "main", "-level:v", "main", "-g", "15", "-bf", "2", "-qmin", "2", "-qmax", "12", "-intra_dc_precision", "1",
-            "-flags:v", "+ilme+ildct", "-trellis", "2", "-mbd", "rd", "-aspect", "4:3", "-pix_fmt", "yuv420p",
-            "-c:a", "ac3", "-b:a", "448k", "-ar", "48000", "-mpegts_flags", "resend_headers", "-f", "mpegts", f"tcp://127.0.0.1:{rec_port}"
+            "-map", "[out_prev_v]", "-an", "-c:v", "rawvideo", "-pix_fmt", "rgb24",
+            "-fps_mode", "passthrough", "-flush_packets", "1", "-f", "rawvideo", "pipe:1",
+            "-map", "[out_prev_a]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
+            "-flush_packets", "1", "-f", "s16le", f"tcp://127.0.0.1:{prev_port}",
+            "-map", "[out_rec_v]", "-map", "[out_rec_a]",
+            "-c:v", "mpeg2video", "-b:v", "7500k", "-maxrate", "9000k", "-bufsize", "3670k",
+            "-g", "12", "-bf", "0",
+            "-qmin", "2", "-qmax", "8", "-intra_dc_precision", "2",
+            "-flags:v", "+ilme+ildct",
+            "-aspect", "4:3", "-pix_fmt", "yuv420p",
+            "-c:a", "ac3", "-b:a", "448k", "-ar", "48000",
+            "-mpegts_flags", "resend_headers", "-f", "mpegts", f"tcp://127.0.0.1:{rec_port}"
         ]
         try:
             self.process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=FRAME_SZ * 2, creationflags=NO_WIN)
@@ -386,7 +395,6 @@ class DVDRecorderGUI:
             try: self.root.after_cancel(self._timer_after_id)
             except Exception: pass
 
-        # Guard: If currently recording or finalizing, finish and save file first
         if self.is_recording:
             self.status_label.config(text="Status: Finalizing and saving recording before exit...", fg="#e67e22")
             self.start_btn.config(state=tk.DISABLED); self.stop_btn.config(state=tk.DISABLED); self.timer_btn.config(state=tk.DISABLED)
