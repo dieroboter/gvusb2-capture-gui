@@ -1,4 +1,4 @@
-import os, sys, time, datetime, threading, socket, subprocess
+import os, sys, time, datetime, threading, socket, subprocess, re
 from collections import deque
 import tkinter as tk
 from tkinter import messagebox
@@ -16,6 +16,71 @@ PREV_AUD_DELAY = 300
 NO_WIN = 0x08000000 if sys.platform == "win32" else 0
 
 
+def verify_devices():
+    """Queries DirectShow devices via FFmpeg before the GUI is allowed to open."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=NO_WIN
+        )
+        output = proc.stderr
+    except FileNotFoundError:
+        return False, "FFmpeg was not found in your system PATH.\nPlease install FFmpeg and try again."
+    except Exception as e:
+        return False, f"Failed to query capture devices:\n{e}"
+
+    video_devices, audio_devices = [], []
+    current_section = None
+
+    for line in output.splitlines():
+        if "Alternative name" in line:
+            continue
+
+        new_style = re.search(r'"([^"]+)"\s*\(([^)]*)\)', line)
+        if new_style:
+            dev_name = new_style.group(1)
+            dev_types = [t.strip().lower() for t in new_style.group(2).split(",")]
+            if "video" in dev_types:
+                video_devices.append(dev_name)
+            if "audio" in dev_types:
+                audio_devices.append(dev_name)
+            continue
+
+        if "DirectShow video devices" in line:
+            current_section = "video"
+            continue
+        elif "DirectShow audio devices" in line:
+            current_section = "audio"
+            continue
+
+        if current_section:
+            match = re.search(r'"([^"]+)"', line)
+            if match:
+                dev_name = match.group(1)
+                if current_section == "video":
+                    video_devices.append(dev_name)
+                elif current_section == "audio":
+                    audio_devices.append(dev_name)
+
+    missing = []
+    if REQ_VID not in video_devices:
+        missing.append(f"• Video Device: '{REQ_VID}'")
+    if REQ_AUD not in audio_devices:
+        missing.append(f"• Audio Device: '{REQ_AUD}'")
+
+    if missing:
+        msg = "The required capture devices were not found:\n\n" + "\n".join(missing)
+        msg += "\n\nPlease connect your I-O Data GV-USB2 adapter and try again."
+        return False, msg
+
+    return True, ""
+
+
 class LiveAudioPlayer:
     def __init__(self, sample_rate=48000, channels=2, blocksize=1024):
         self.sr, self.ch, self.blocksize = sample_rate, channels, blocksize
@@ -26,18 +91,14 @@ class LiveAudioPlayer:
         self.buffer = bytearray()
 
         # Buffer thresholds to balance low latency with smooth playback:
-        # Initial cushion before starting output (~60ms)
         self.prebuffer_bytes = int(self.sr * self.bytes_per_sample * 0.06)
-        # Maximum buffer allowed before gentle trimming (~280ms)
         self.max_buffer_bytes = int(self.sr * self.bytes_per_sample * 0.28)
-        # Target buffer size after trimming (~120ms)
         self.target_buffer_bytes = int(self.sr * self.bytes_per_sample * 0.12)
         self.started_playing = False
 
     def _callback(self, outdata, frames, time_info, status):
         bytes_needed = frames * self.bytes_per_sample
         with self._lock:
-            # Wait for initial buffer cushion to accumulate
             if not self.started_playing:
                 if len(self.buffer) >= self.prebuffer_bytes:
                     self.started_playing = True
@@ -49,7 +110,6 @@ class LiveAudioPlayer:
                 outdata[:] = self.buffer[:bytes_needed]
                 del self.buffer[:bytes_needed]
             else:
-                # Buffer underrun: play remaining audio and pad silence
                 avail = len(self.buffer)
                 if avail > 0:
                     outdata[:avail] = self.buffer
@@ -81,11 +141,9 @@ class LiveAudioPlayer:
         if self.running and data:
             with self._lock:
                 self.buffer.extend(data)
-                # If latency starts building up, trim only the oldest excess
-                # (never wipe to 0 to avoid audible cutouts)
                 if len(self.buffer) > self.max_buffer_bytes:
                     excess = len(self.buffer) - self.target_buffer_bytes
-                    excess -= (excess % self.bytes_per_sample)  # Keep frame alignment
+                    excess -= (excess % self.bytes_per_sample)
                     if excess > 0:
                         del self.buffer[:excess]
 
@@ -121,7 +179,7 @@ class DVDRecorderGUI:
         self._audio_conn, self._rec_conn = None, None
         self._frame_lock, self._frame_queue = threading.Lock(), deque(maxlen=2)
 
-        self.status_label = tk.Label(root, text="Status: Detecting capture devices...", font=("Arial", 11, "bold"), fg="#f39c12")
+        self.status_label = tk.Label(root, text="Status: Initializing capture engine...", font=("Arial", 11, "bold"), fg="#f39c12")
         self.status_label.pack(pady=(10, 6))
         self.canvas = tk.Canvas(root, width=PREV_W, height=PREV_H, bg="black", highlightthickness=0)
         self.canvas.pack(padx=14, pady=4)
@@ -157,6 +215,71 @@ class DVDRecorderGUI:
         s.settimeout(0.5)
         return s, s.getsockname()[1]
 
+    def _get_seek_offset(self, filepath):
+        """Calculates the relative seek offset between file start and the first VIDEO keyframe."""
+        # 1. Earliest packet PTS across all streams
+        cmd_start = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "packet=pts_time",
+            "-of", "csv=p=0",
+            filepath
+        ]
+        file_start_pts = None
+        try:
+            proc = subprocess.Popen(cmd_start, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=NO_WIN)
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    try:
+                        file_start_pts = float(line.split(",")[0])
+                        break
+                    except ValueError:
+                        pass
+            try: proc.kill()
+            except Exception: pass
+        except Exception as e:
+            print(f"[Start Probe Error] {e}", flush=True)
+
+        # 2. First VIDEO keyframe specifically (select_streams v:0)
+        cmd_key = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time,flags",
+            "-of", "csv=p=0",
+            filepath
+        ]
+        first_video_key_pts = None
+        try:
+            proc = subprocess.Popen(cmd_key, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=NO_WIN)
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",")
+                pts_val = None
+                is_key = False
+                for p in parts:
+                    if "K" in p:
+                        is_key = True
+                    try:
+                        pts_val = float(p)
+                    except ValueError:
+                        pass
+                if is_key and pts_val is not None:
+                    first_video_key_pts = pts_val
+                    break
+            try: proc.kill()
+            except Exception: pass
+        except Exception as e:
+            print(f"[Key Probe Error] {e}", flush=True)
+
+        if file_start_pts is not None and first_video_key_pts is not None:
+            offset = max(0.0, first_video_key_pts - file_start_pts)
+            print(f"[Sync] File Start PTS: {file_start_pts:.4f}s, First VIDEO Keyframe PTS: {first_video_key_pts:.4f}s -> Seek Offset: {offset:.4f}s", flush=True)
+            return offset
+        print("[Sync] Warning: Could not determine keyframe offset, defaulting to 0.0s", flush=True)
+        return 0.0
+
     def start_continuous_capture(self):
         try:
             self._audio_sock, prev_audio_port = self._make_tcp_server(rcvbuf=2 * 1024 * 1024)
@@ -167,7 +290,7 @@ class DVDRecorderGUI:
             return
 
         cmd = [
-            "ffmpeg", "-y", "-fflags", "nobuffer", "-flags", "low_delay", "-thread_queue_size", "1024",
+            "ffmpeg", "-y", "-fflags", "nobuffer", "-thread_queue_size", "1024",
             "-f", "dshow", "-video_size", f"{CAP_W}x{CAP_H}", "-framerate", "29.97", "-pixel_format", "yuyv422", "-rtbufsize", "256M", "-i", f"video={REQ_VID}",
             "-thread_queue_size", "1024", "-f", "dshow", "-guess_layout_max", "0", "-ac", "2", "-rtbufsize", "256M", "-i", f"audio={REQ_AUD}",
             "-filter_complex", (
@@ -180,8 +303,16 @@ class DVDRecorderGUI:
             ),
             "-map", "[out_prev_v]", "-an", "-c:v", "rawvideo", "-pix_fmt", "rgb24", "-fps_mode", "passthrough", "-flush_packets", "1", "-f", "rawvideo", "pipe:1",
             "-map", "[out_prev_a]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", "-flush_packets", "1", "-f", "s16le", f"tcp://127.0.0.1:{prev_audio_port}",
-            "-map", "[out_rec_v]", "-map", "[out_rec_a]", "-c:v", "mpeg2video", "-q:v", "1", "-g", "1", "-bf", "0", "-flags", "+ilme+ildct",
-            "-c:a", "ac3", "-b:a", "448k", "-ar", "48000", "-mpegts_flags", "resend_headers", "-f", "mpegts", f"tcp://127.0.0.1:{rec_port}"
+            "-map", "[out_rec_v]", "-map", "[out_rec_a]",
+            "-c:v", "mpeg2video",
+            "-b:v", "8500k", "-maxrate", "9000k", "-bufsize", "1835k",
+            "-profile:v", "main", "-level:v", "main",
+            "-g", "15", "-bf", "0",
+            "-flags:v", "+ilme+ildct",
+            "-trellis", "1",
+            "-aspect", "4:3", "-pix_fmt", "yuv420p",
+            "-c:a", "ac3", "-b:a", "448k", "-ar", "48000",
+            "-mpegts_flags", "resend_headers", "-f", "mpegts", f"tcp://127.0.0.1:{rec_port}"
         ]
 
         try:
@@ -201,8 +332,9 @@ class DVDRecorderGUI:
     def _drain_stderr(self, pipe):
         try:
             for line in iter(pipe.readline, b""):
-                if any(k in line.decode("utf-8", errors="ignore").lower() for k in ("error", "fail")):
-                    print(f"[FFmpeg] {line.decode().strip()}", flush=True)
+                text = line.decode("utf-8", errors="ignore").strip()
+                if any(k in text.lower() for k in ("error", "fail", "invalid", "cannot", "abort")):
+                    print(f"[FFmpeg] {text}", flush=True)
         except Exception: pass
 
     def _pipe_reader_worker(self):
@@ -284,16 +416,38 @@ class DVDRecorderGUI:
         threading.Thread(target=self._finalize_file, args=(self._temp_output, self.current_output), daemon=True).start()
 
     def _finalize_file(self, temp_out, final_out):
-        cmd = ["ffmpeg", "-y", "-fflags", "+discardcorrupt+genpts", "-i", temp_out, "-map", "0:v:0", "-map", "0:a:0",
-               "-c:v", "mpeg2video", "-aspect", "4:3", "-pix_fmt", "yuv420p", "-b:v", "8800k", "-minrate", "8000k", "-maxrate", "9000k",
-               "-bufsize", "1835k", "-g", "15", "-bf", "2", "-flags", "+ilme+ildct", "-af", "aresample=async=1", "-c:a", "ac3", "-b:a", "448k",
-               "-ar", "48000", "-avoid_negative_ts", "make_zero", "-f", "dvd", final_out]
+        seek_offset = self._get_seek_offset(temp_out)
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-fflags", "+discardcorrupt+genpts",
+            "-ss", str(seek_offset),
+            "-i", temp_out,
+            "-map", "0:v:0", "-map", "0:a:0",
+            "-c:v", "copy",
+            "-c:a", "ac3", "-b:a", "448k", "-ar", "48000",
+            "-avoid_negative_ts", "make_zero",
+            "-f", "dvd", final_out
+        ]
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WIN)
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=NO_WIN
+            )
+            if proc.returncode != 0:
+                print(f"[Finalize Error] FFmpeg failed with exit code {proc.returncode}:\n{proc.stderr}", flush=True)
+
             if os.path.exists(final_out) and os.path.getsize(final_out) > 10000:
                 if os.path.exists(temp_out): os.remove(temp_out)
-            elif os.path.exists(temp_out): os.replace(temp_out, final_out)
-        except Exception:
+                print(f"[Sync] Successfully finalized DVD MPEG file: {final_out}", flush=True)
+            elif os.path.exists(temp_out):
+                print("[Finalize] Warning: Fallback to renaming temp file", flush=True)
+                os.replace(temp_out, final_out)
+        except Exception as e:
+            print(f"[Finalize] Error: {e}", flush=True)
             if os.path.exists(temp_out): os.replace(temp_out, final_out)
         if not self.is_recording:
             self.root.after(0, lambda: self.status_label.config(text=f"Status: Live Preview (Saved '{final_out}')", fg="#2ecc71"))
@@ -321,5 +475,14 @@ class DVDRecorderGUI:
 
 if __name__ == "__main__":
     root = tk.Tk()
+    root.withdraw()
+
+    devices_ok, err_msg = verify_devices()
+    if not devices_ok:
+        messagebox.showerror("Device Not Found", err_msg)
+        root.destroy()
+        sys.exit(1)
+
+    root.deiconify()
     app = DVDRecorderGUI(root)
     root.mainloop()
