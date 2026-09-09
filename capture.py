@@ -217,7 +217,6 @@ class DVDRecorderGUI:
 
     def _get_seek_offset(self, filepath):
         """Calculates the relative seek offset between file start and the first VIDEO keyframe."""
-        # 1. Earliest packet PTS across all streams
         cmd_start = [
             "ffprobe", "-v", "error",
             "-show_entries", "packet=pts_time",
@@ -240,7 +239,6 @@ class DVDRecorderGUI:
         except Exception as e:
             print(f"[Start Probe Error] {e}", flush=True)
 
-        # 2. First VIDEO keyframe specifically (select_streams v:0)
         cmd_key = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
@@ -274,10 +272,7 @@ class DVDRecorderGUI:
             print(f"[Key Probe Error] {e}", flush=True)
 
         if file_start_pts is not None and first_video_key_pts is not None:
-            offset = max(0.0, first_video_key_pts - file_start_pts)
-            print(f"[Sync] File Start PTS: {file_start_pts:.4f}s, First VIDEO Keyframe PTS: {first_video_key_pts:.4f}s -> Seek Offset: {offset:.4f}s", flush=True)
-            return offset
-        print("[Sync] Warning: Could not determine keyframe offset, defaulting to 0.0s", flush=True)
+            return max(0.0, first_video_key_pts - file_start_pts)
         return 0.0
 
     def start_continuous_capture(self):
@@ -442,9 +437,7 @@ class DVDRecorderGUI:
 
             if os.path.exists(final_out) and os.path.getsize(final_out) > 10000:
                 if os.path.exists(temp_out): os.remove(temp_out)
-                print(f"[Sync] Successfully finalized DVD MPEG file: {final_out}", flush=True)
             elif os.path.exists(temp_out):
-                print("[Finalize] Warning: Fallback to renaming temp file", flush=True)
                 os.replace(temp_out, final_out)
         except Exception as e:
             print(f"[Finalize] Error: {e}", flush=True)
