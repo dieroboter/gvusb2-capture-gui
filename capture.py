@@ -1,757 +1,325 @@
+import os, sys, time, datetime, threading, socket, subprocess
+from collections import deque
 import tkinter as tk
 from tkinter import messagebox
-import subprocess
-import os
-import time
 from PIL import Image, ImageTk
-import threading
-import sys
-import datetime
-import re
-from collections import deque
-import socket
-import ctypes
-from ctypes import wintypes
+import sounddevice as sd
 
-REQUIRED_VIDEO_DEVICE = "GV-USB2, Analog Capture"
-REQUIRED_AUDIO_DEVICE = "GV-USB2, Analog WaveIn"
+REQ_VID, REQ_AUD = "GV-USB2, Analog Capture", "GV-USB2, Analog WaveIn"
+CAP_W, CAP_H, PREV_W, PREV_H = 720, 480, 640, 480
+FRAME_SZ = PREV_W * PREV_H * 3
 
-# Source capture resolution (720x480 NTSC)
-CAPTURE_WIDTH = 720
-CAPTURE_HEIGHT = 480
+# Audio delay in ms to synchronize with video
+REC_AUD_DELAY = 300
+PREV_AUD_DELAY = 300
 
-# 4:3 Corrected Display Resolution
-PREVIEW_WIDTH = 640
-PREVIEW_HEIGHT = 480
-PREVIEW_FRAME_SIZE = PREVIEW_WIDTH * PREVIEW_HEIGHT * 3  # RGB24 (921,600 bytes)
-
-# Video / Audio Sync Offset (in seconds)
-# Adjusted by +0.13831s (0.5005 + 0.13831 = 0.63881s) to eliminate audio desync without inserting leading silence.
-AUDIO_TRIM_START = 0.63881
+NO_WIN = 0x08000000 if sys.platform == "win32" else 0
 
 
-# ==========================================
-# Native Windows Live Audio Playback Engine
-# ==========================================
-WAVE_FORMAT_PCM = 1
-WAVE_MAPPER = 0xFFFFFFFF  # (UINT)-1 in Win32 SDK
-WHDR_DONE = 0x00000001
-WHDR_PREPARED = 0x00000002
-
-
-class WAVEFORMATEX(ctypes.Structure):
-    _fields_ = [
-        ("wFormatTag", wintypes.WORD),
-        ("nChannels", wintypes.WORD),
-        ("nSamplesPerSec", wintypes.DWORD),
-        ("nAvgBytesPerSec", wintypes.DWORD),
-        ("nBlockAlign", wintypes.WORD),
-        ("wBitsPerSample", wintypes.WORD),
-        ("cbSize", wintypes.WORD),
-    ]
-
-
-class WAVEHDR(ctypes.Structure):
-    pass
-
-
-WAVEHDR._fields_ = [
-    ("lpData", ctypes.c_void_p),
-    ("dwBufferLength", wintypes.DWORD),
-    ("dwBytesRecorded", wintypes.DWORD),
-    ("dwUser", ctypes.c_size_t),
-    ("dwFlags", wintypes.DWORD),
-    ("dwLoops", wintypes.DWORD),
-    ("lpNext", ctypes.POINTER(WAVEHDR)),
-    ("reserved", ctypes.c_size_t),
-]
-
-
-class WindowsLiveAudioPlayer:
-    """Zero-dependency, low-latency live PCM audio player using Win32 waveOut API."""
-    def __init__(self, sample_rate=48000, channels=2, num_buffers=8, buffer_size=4096):
-        self.sample_rate = sample_rate
-        self.channels = channels
-        self.num_buffers = num_buffers
-        self.buffer_size = buffer_size
-        self.hWaveOut = wintypes.HANDLE(0)
+class LiveAudioPlayer:
+    def __init__(self, sample_rate=48000, channels=2, blocksize=1024):
+        self.sr, self.ch, self.blocksize = sample_rate, channels, blocksize
+        self.bytes_per_sample = 2 * channels  # 4 bytes for 16-bit stereo
+        self.stream = None
         self.running = False
-        self.buffers = []
-        self.raw_buffers = []
-        self.cur_buf_idx = 0
         self._lock = threading.Lock()
-        self.winmm = ctypes.windll.winmm if sys.platform == "win32" else None
+        self.buffer = bytearray()
+
+        # Buffer thresholds to balance low latency with smooth playback:
+        # Initial cushion before starting output (~60ms)
+        self.prebuffer_bytes = int(self.sr * self.bytes_per_sample * 0.06)
+        # Maximum buffer allowed before gentle trimming (~280ms)
+        self.max_buffer_bytes = int(self.sr * self.bytes_per_sample * 0.28)
+        # Target buffer size after trimming (~120ms)
+        self.target_buffer_bytes = int(self.sr * self.bytes_per_sample * 0.12)
+        self.started_playing = False
+
+    def _callback(self, outdata, frames, time_info, status):
+        bytes_needed = frames * self.bytes_per_sample
+        with self._lock:
+            # Wait for initial buffer cushion to accumulate
+            if not self.started_playing:
+                if len(self.buffer) >= self.prebuffer_bytes:
+                    self.started_playing = True
+                else:
+                    outdata[:] = b"\x00" * bytes_needed
+                    return
+
+            if len(self.buffer) >= bytes_needed:
+                outdata[:] = self.buffer[:bytes_needed]
+                del self.buffer[:bytes_needed]
+            else:
+                # Buffer underrun: play remaining audio and pad silence
+                avail = len(self.buffer)
+                if avail > 0:
+                    outdata[:avail] = self.buffer
+                    self.buffer.clear()
+                    outdata[avail:] = b"\x00" * (bytes_needed - avail)
+                else:
+                    outdata[:] = b"\x00" * bytes_needed
 
     def start(self):
-        if not self.winmm:
-            return
         with self._lock:
-            wfx = WAVEFORMATEX()
-            wfx.wFormatTag = WAVE_FORMAT_PCM
-            wfx.nChannels = self.channels
-            wfx.nSamplesPerSec = self.sample_rate
-            wfx.wBitsPerSample = 16
-            wfx.nBlockAlign = self.channels * 2
-            wfx.nAvgBytesPerSec = self.sample_rate * wfx.nBlockAlign
-            wfx.cbSize = 0
-
-            res = self.winmm.waveOutOpen(ctypes.byref(self.hWaveOut), WAVE_MAPPER, ctypes.byref(wfx), 0, 0, 0)
-            if res != 0:
-                self.hWaveOut = wintypes.HANDLE(0)
+            if self.running:
                 return
+            try:
+                self.buffer.clear()
+                self.started_playing = False
+                self.stream = sd.RawOutputStream(
+                    samplerate=self.sr,
+                    channels=self.ch,
+                    dtype="int16",
+                    blocksize=self.blocksize,
+                    callback=self._callback,
+                )
+                self.stream.start()
+                self.running = True
+            except Exception as e:
+                print(f"[Audio] Initialization error: {e}", flush=True)
 
-            self.buffers = []
-            self.raw_buffers = []
-            for _ in range(self.num_buffers):
-                raw_buf = ctypes.create_string_buffer(self.buffer_size)
-                hdr = WAVEHDR()
-                hdr.lpData = ctypes.cast(raw_buf, ctypes.c_void_p)
-                hdr.dwBufferLength = self.buffer_size
-                hdr.dwFlags = WHDR_DONE
-                self.buffers.append(hdr)
-                self.raw_buffers.append(raw_buf)
-
-            self.cur_buf_idx = 0
-            self.running = True
-
-    def write_chunk(self, data):
-        with self._lock:
-            if not self.running or not self.hWaveOut:
-                return
-
-            hdr = self.buffers[self.cur_buf_idx]
-            raw_buf = self.raw_buffers[self.cur_buf_idx]
-
-            for _ in range(15):
-                if hdr.dwFlags & WHDR_DONE:
-                    break
-                time.sleep(0.002)
-
-            # Drop chunk if device buffer is still busy to avoid driver corruptions
-            if not (hdr.dwFlags & WHDR_DONE):
-                return
-
-            if hdr.dwFlags & WHDR_PREPARED:
-                self.winmm.waveOutUnprepareHeader(self.hWaveOut, ctypes.byref(hdr), ctypes.sizeof(WAVEHDR))
-
-            chunk_len = min(len(data), self.buffer_size)
-            ctypes.memmove(raw_buf, data, chunk_len)
-            hdr.dwBufferLength = chunk_len
-            hdr.dwFlags = 0
-
-            self.winmm.waveOutPrepareHeader(self.hWaveOut, ctypes.byref(hdr), ctypes.sizeof(WAVEHDR))
-            self.winmm.waveOutWrite(self.hWaveOut, ctypes.byref(hdr), ctypes.sizeof(WAVEHDR))
-
-            self.cur_buf_idx = (self.cur_buf_idx + 1) % self.num_buffers
+    def write(self, data):
+        if self.running and data:
+            with self._lock:
+                self.buffer.extend(data)
+                # If latency starts building up, trim only the oldest excess
+                # (never wipe to 0 to avoid audible cutouts)
+                if len(self.buffer) > self.max_buffer_bytes:
+                    excess = len(self.buffer) - self.target_buffer_bytes
+                    excess -= (excess % self.bytes_per_sample)  # Keep frame alignment
+                    if excess > 0:
+                        del self.buffer[:excess]
 
     def stop(self):
         with self._lock:
+            if not self.running:
+                return
             self.running = False
-            if self.winmm and self.hWaveOut:
-                self.winmm.waveOutReset(self.hWaveOut)
-                for hdr in self.buffers:
-                    if hdr.dwFlags & WHDR_PREPARED:
-                        self.winmm.waveOutUnprepareHeader(self.hWaveOut, ctypes.byref(hdr), ctypes.sizeof(WAVEHDR))
-                self.winmm.waveOutClose(self.hWaveOut)
-                self.hWaveOut = wintypes.HANDLE(0)
-            self.buffers.clear()
-            self.raw_buffers.clear()
+            stream = self.stream
+            self.stream = None
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        with self._lock:
+            self.buffer.clear()
+            self.started_playing = False
 
 
-def safe_remove_file(filepath):
-    """Robustly deletes a file on Windows/Unix."""
-    if not filepath or not os.path.exists(filepath):
-        return
-
-    for _ in range(5):
-        try:
-            os.remove(filepath)
-            return
-        except (PermissionError, OSError):
-            time.sleep(0.1)
-
-    if sys.platform == "win32" and os.path.exists(filepath):
-        try:
-            subprocess.run(
-                f'del /f /q "{os.path.abspath(filepath)}"',
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=0x08000000
-            )
-        except Exception:
-            pass
-
-
-def get_media_duration(filepath):
-    """Accurately extracts media duration for MPEG-PS / VOB formats without Unicode crashes."""
-    kw = {
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "ignore"
-    }
-    if sys.platform == "win32":
-        kw["creationflags"] = 0x08000000
-
-    try:
-        res = subprocess.run([
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            filepath
-        ], **kw)
-        dur_str = res.stdout.strip()
-        if dur_str and dur_str != "N/A":
-            dur = float(dur_str)
-            if dur > 0:
-                return dur
-    except Exception:
-        pass
-
-    try:
-        proc = subprocess.run(["ffmpeg", "-i", filepath, "-f", "null", "-"], **kw)
-        matches = re.findall(r'time=(\d+):(\d+):(\d+(?:\.\d+)?)', proc.stderr)
-        if matches:
-            h, m, s = matches[-1]
-            return int(h) * 3600 + int(m) * 60 + float(s)
-        matches_sec = re.findall(r'time=(\d+\.\d+)(?!\:)', proc.stderr)
-        if matches_sec:
-            return float(matches_sec[-1])
-    except Exception:
-        pass
-
-    return None
-
-
-class GVUSB2CaptureGUI:
+class DVDRecorderGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("I-O Data GV-USB2 Recorder")
-        self.root.geometry("680x620")
-        self.root.resizable(False, False)
+        root.title("GV-USB2 Recorder")
+        root.resizable(False, False)
+        root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.process, self.is_recording, self._is_closing = None, False, False
+        self._rec_file, self._rec_lock = None, threading.Lock()
+        self.current_output, self._temp_output = None, None
+        self.audio_player = LiveAudioPlayer()
+        self._audio_sock, self._rec_sock = None, None
+        self._audio_conn, self._rec_conn = None, None
+        self._frame_lock, self._frame_queue = threading.Lock(), deque(maxlen=2)
 
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-        self.process = None
-        self.running = False
-        self.preview_thread = None
-        self.audio_thread = None
-        self.image_item = None
-        self.current_output = None
-        self._temp_output = None
-        self._stopping = False
-        self._is_closing = False
-        self._had_error = False
-        self._current_photo = None
-
-        # Audio player & socket
-        self.audio_player = WindowsLiveAudioPlayer(sample_rate=48000, channels=2)
-        self._audio_sock = None
-
-        # Lock-free video frame queue & event dispatch
-        self._frame_lock = threading.Lock()
-        self._frame_queue = deque(maxlen=2)
-        self._render_scheduled = False
-
-        self.status_label = tk.Label(
-            root, text="Status: Detecting capture devices...", 
-            font=("Arial", 12, "bold"), fg="#f39c12"
-        )
-        self.status_label.pack(pady=10)
-
-        self.canvas = tk.Canvas(root, width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT, bg="black")
-        self.canvas.pack(pady=5)
+        self.status_label = tk.Label(root, text="Status: Detecting capture devices...", font=("Arial", 11, "bold"), fg="#f39c12")
+        self.status_label.pack(pady=(10, 6))
+        self.canvas = tk.Canvas(root, width=PREV_W, height=PREV_H, bg="black", highlightthickness=0)
+        self.canvas.pack(padx=14, pady=4)
+        self.photo = ImageTk.PhotoImage(Image.new("RGB", (PREV_W, PREV_H), "black"))
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
 
         btn_frame = tk.Frame(root)
-        btn_frame.pack(pady=15)
-
-        self.start_btn = tk.Button(
-            btn_frame, text="Start Recording & Preview",
-            command=self.start_capture, bg="#2ecc71", fg="white",
-            font=("Arial", 11, "bold"), padx=15, pady=8, state=tk.DISABLED
-        )
+        btn_frame.pack(pady=(8, 12))
+        self.start_btn = tk.Button(btn_frame, text="Start Recording", command=self.start_recording, bg="#2ecc71", fg="white", font=("Arial", 11, "bold"), padx=15, pady=6, state=tk.DISABLED)
         self.start_btn.grid(row=0, column=0, padx=15)
-
-        self.stop_btn = tk.Button(
-            btn_frame, text="Stop Recording",
-            command=self.stop_capture, bg="#e74c3c", fg="white",
-            font=("Arial", 11, "bold"), state=tk.DISABLED, padx=15, pady=8
-        )
+        self.stop_btn = tk.Button(btn_frame, text="Stop Recording", command=self.stop_recording, bg="#e74c3c", fg="white", font=("Arial", 11, "bold"), padx=15, pady=6, state=tk.DISABLED)
         self.stop_btn.grid(row=0, column=1, padx=15)
 
-        threading.Thread(target=self.async_verify_devices, daemon=True).start()
+        self.root.after(15, self._render_tick)
+        threading.Thread(target=self.start_continuous_capture, daemon=True).start()
 
-    def async_verify_devices(self):
-        """Asynchronously queries DirectShow devices without freezing the UI."""
-        kwargs = {
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "text": True,
-            "encoding": "utf-8",
-            "errors": "ignore"
-        }
-        if sys.platform == "win32":
-            kwargs["creationflags"] = 0x08000000
-
-        try:
-            proc = subprocess.run(
-                ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-                **kwargs
-            )
-            output = proc.stderr
-        except FileNotFoundError:
-            self.root.after(0, self.on_ffmpeg_not_found)
-            return
-        except Exception as e:
-            self.root.after(0, self.on_device_check_failed, str(e))
-            return
-
-        video_devices, audio_devices = [], []
-        current_section = None
-
-        for line in output.splitlines():
-            if "Alternative name" in line:
-                continue
-
-            new_style = re.search(r'"([^"]+)"\s*\(([^)]*)\)', line)
-            if new_style:
-                dev_name = new_style.group(1)
-                dev_types = [t.strip().lower() for t in new_style.group(2).split(",")]
-                if "video" in dev_types:
-                    video_devices.append(dev_name)
-                if "audio" in dev_types:
-                    audio_devices.append(dev_name)
-                continue
-
-            if "DirectShow video devices" in line:
-                current_section = "video"
-                continue
-            elif "DirectShow audio devices" in line:
-                current_section = "audio"
-                continue
-
-            if current_section:
-                match = re.search(r'"([^"]+)"', line)
-                if match:
-                    dev_name = match.group(1)
-                    if current_section == "video":
-                        video_devices.append(dev_name)
-                    elif current_section == "audio":
-                        audio_devices.append(dev_name)
-
-        missing = []
-        if REQUIRED_VIDEO_DEVICE not in video_devices:
-            missing.append(f"Video device not found: '{REQUIRED_VIDEO_DEVICE}'")
-        if REQUIRED_AUDIO_DEVICE not in audio_devices:
-            missing.append(f"Audio device not found: '{REQUIRED_AUDIO_DEVICE}'")
-
-        if missing:
-            self.root.after(0, self.on_required_devices_missing, missing, video_devices, audio_devices)
-        else:
-            self.root.after(0, self.on_devices_ready)
-
-    def on_ffmpeg_not_found(self):
-        try:
-            if not self.root.winfo_exists():
-                return
-        except tk.TclError:
-            return
-        self.status_label.config(text="Status: FFmpeg not found in PATH", fg="#e74c3c")
-        messagebox.showerror("Error", "FFmpeg is not installed or not found in system PATH.")
-
-    def on_device_check_failed(self, err_msg):
-        try:
-            if not self.root.winfo_exists():
-                return
-        except tk.TclError:
-            return
-        self.status_label.config(text="Status: Error detecting devices", fg="#e74c3c")
-        messagebox.showerror("Error", f"Error querying DirectShow devices:\n{err_msg}")
-
-    def on_required_devices_missing(self, missing, video_devices, audio_devices):
-        try:
-            if not self.root.winfo_exists():
-                return
-        except tk.TclError:
-            return
-        self.status_label.config(text="Status: Required capture device not connected", fg="#e74c3c")
-        err_msg = "\n".join(missing) + "\n\nPlease connect your I-O Data GV-USB2 adapter and restart."
-        messagebox.showwarning("Device Not Found", err_msg)
-
-    def on_devices_ready(self):
-        try:
-            if not self.root.winfo_exists():
-                return
-        except tk.TclError:
-            return
-        self.status_label.config(text="Status: Ready", fg="black")
-        self.start_btn.config(state=tk.NORMAL)
-
-    def start_capture(self):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.current_output = f"capture_{timestamp}.mpg"
-        self._temp_output = f"temp_capture_{timestamp}.mpg"
-        self._had_error = False
-
-        video_device = f"video={REQUIRED_VIDEO_DEVICE}"
-        audio_device = f"audio={REQUIRED_AUDIO_DEVICE}"
-
-        # Initialize persistent single PhotoImage on canvas
-        self.canvas.delete("all")
-        blank = Image.new("RGB", (PREVIEW_WIDTH, PREVIEW_HEIGHT), "black")
-        self._current_photo = ImageTk.PhotoImage(image=blank)
-        self.image_item = self.canvas.create_image(0, 0, anchor=tk.NW, image=self._current_photo)
-
-        self._render_scheduled = False
+    def _render_tick(self):
+        if self._is_closing: return
         with self._frame_lock:
-            self._frame_queue.clear()
+            frame = self._frame_queue.popleft() if self._frame_queue else None
+        if frame and self.process:
+            try: self.photo.paste(Image.frombytes("RGB", (PREV_W, PREV_H), frame))
+            except Exception: pass
+        if not self._is_closing: self.root.after(15, self._render_tick)
 
-        # Pre-bind UDP socket before launching FFmpeg to prevent race condition
+    def _make_tcp_server(self, rcvbuf=None):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if rcvbuf:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        s.settimeout(0.5)
+        return s, s.getsockname()[1]
+
+    def start_continuous_capture(self):
         try:
-            self._audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._audio_sock.bind(('127.0.0.1', 0))
-            self._audio_sock.settimeout(0.2)
-            audio_port = self._audio_sock.getsockname()[1]
+            self._audio_sock, prev_audio_port = self._make_tcp_server(rcvbuf=2 * 1024 * 1024)
+            self._rec_sock, rec_port = self._make_tcp_server(rcvbuf=8 * 1024 * 1024)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to initialize audio preview socket:\n{e}")
+            err = str(e)
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Socket allocation failed: {err}"))
             return
-
-        self.status_label.config(text="Status: Initializing preview & recording...", fg="#f39c12")
 
         cmd = [
-            "ffmpeg", "-y",
-            # DirectShow Video Input
-            "-thread_queue_size", "1024",
-            "-f", "dshow",
-            "-video_size", f"{CAPTURE_WIDTH}x{CAPTURE_HEIGHT}",
-            "-framerate", "29.97",
-            "-pixel_format", "yuyv422",
-            "-rtbufsize", "256M",
-            "-i", video_device,
-            # DirectShow Audio Input
-            "-thread_queue_size", "1024",
-            "-f", "dshow",
-            "-guess_layout_max", "0",
-            "-ac", "2",
-            "-rtbufsize", "256M",
-            "-i", audio_device,
-            # Multi-threaded filter graph with video & audio split
-            "-filter_threads", "0",
-            "-filter_complex_threads", "0",
-            "-filter_complex",
-            "[0:v]split=2[rec_v][prev_v];"
-            r"[rec_v]select=gte(n\,30),setpts=PTS-STARTPTS,setfield=tff[out_rec_v];"
-            f"[prev_v]field=top,scale={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:flags=fast_bilinear,format=rgb24[out_prev_v];"
-            "[1:a]asplit=2[rec_a_in][prev_a_in];"
-            f"[rec_a_in]atrim=start={AUDIO_TRIM_START:.5f},asetpts=PTS-STARTPTS,aresample=async=1,afade=t=in:st=0:d=0.040[out_rec_a];"
-            "[prev_a_in]aresample=async=1[out_prev_a]",
-            # 1. Main Recording output (Multi-threaded MPEG-2 encoder)
-            "-map", "[out_rec_v]", "-map", "[out_rec_a]",
-            "-c:v", "mpeg2video",
-            "-b:v", "8000k", "-maxrate", "9000k", "-bufsize", "1835k",
-            "-profile:v", "main", "-level:v", "main",
-            "-g", "15", "-bf", "2",
-            "-flags", "+ilme+ildct",
-            "-trellis", "1",
-            "-aspect", "4:3", "-pix_fmt", "yuv420p", "-fps_mode", "cfr",
-            "-threads", "0",
-            "-ar", "48000", "-c:a", "ac3", "-b:a", "384k",
-            "-f", "vob", self._temp_output,
-            # 2. Video Preview output (Zero-conversion raw pipe)
-            "-map", "[out_prev_v]", "-an",
-            "-c:v", "rawvideo", "-pix_fmt", "rgb24",
-            "-f", "rawvideo", "pipe:1",
-            # 3. Audio Preview output (Low-latency UDP stream to localhost)
-            "-map", "[out_prev_a]",
-            "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
-            "-f", "s16le", f"udp://127.0.0.1:{audio_port}?pkt_size=4096"
+            "ffmpeg", "-y", "-fflags", "nobuffer", "-flags", "low_delay", "-thread_queue_size", "1024",
+            "-f", "dshow", "-video_size", f"{CAP_W}x{CAP_H}", "-framerate", "29.97", "-pixel_format", "yuyv422", "-rtbufsize", "256M", "-i", f"video={REQ_VID}",
+            "-thread_queue_size", "1024", "-f", "dshow", "-guess_layout_max", "0", "-ac", "2", "-rtbufsize", "256M", "-i", f"audio={REQ_AUD}",
+            "-filter_complex", (
+                f"[0:v]split=2[rec_v][prev_v];"
+                f"[rec_v]setfield=tff[out_rec_v];"
+                f"[prev_v]setfield=tff,bwdif=mode=0:parity=0:deint=0,scale={PREV_W}:{PREV_H}:flags=fast_bilinear,format=rgb24[out_prev_v];"
+                f"[1:a]asplit=2[rec_a_in][prev_a_in];"
+                f"[rec_a_in]adelay={REC_AUD_DELAY}|{REC_AUD_DELAY},aresample=async=1000:first_pts=0[out_rec_a];"
+                f"[prev_a_in]adelay={PREV_AUD_DELAY}|{PREV_AUD_DELAY},aresample=async=1000:first_pts=0[out_prev_a]"
+            ),
+            "-map", "[out_prev_v]", "-an", "-c:v", "rawvideo", "-pix_fmt", "rgb24", "-fps_mode", "passthrough", "-flush_packets", "1", "-f", "rawvideo", "pipe:1",
+            "-map", "[out_prev_a]", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", "-flush_packets", "1", "-f", "s16le", f"tcp://127.0.0.1:{prev_audio_port}",
+            "-map", "[out_rec_v]", "-map", "[out_rec_a]", "-c:v", "mpeg2video", "-q:v", "1", "-g", "1", "-bf", "0", "-flags", "+ilme+ildct",
+            "-c:a", "ac3", "-b:a", "448k", "-ar", "48000", "-mpegts_flags", "resend_headers", "-f", "mpegts", f"tcp://127.0.0.1:{rec_port}"
         ]
 
-        kwargs = {
-            "stdin": subprocess.PIPE,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.DEVNULL,
-            "bufsize": PREVIEW_FRAME_SIZE * 4
-        }
-
-        if sys.platform == "win32":
-            kwargs["creationflags"] = 0x08000000
-
         try:
-            self.process = subprocess.Popen(cmd, **kwargs)
-            self.running = True
-            self._stopping = False
-            self._is_closing = False
-
-            self.start_btn.config(state=tk.DISABLED)
-            self.stop_btn.config(state=tk.NORMAL)
-
-            # Start video stream consumer thread
-            self.preview_thread = threading.Thread(target=self._pipe_reader_worker, daemon=True)
-            self.preview_thread.start()
-
-            # Start audio receiver & playback thread
-            self.audio_thread = threading.Thread(
-                target=self._audio_receiver_worker, 
-                args=(self._audio_sock,), 
-                daemon=True
-            )
-            self.audio_thread.start()
-
+            self.process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=FRAME_SZ * 2, creationflags=NO_WIN)
+            for target, args in [(self._pipe_reader_worker, ()), (self._audio_receiver_worker, ()), (self._rec_receiver_worker, ()), (self._drain_stderr, (self.process.stderr,))]:
+                threading.Thread(target=target, args=args, daemon=True).start()
+            time.sleep(0.5)
+            if self.process.poll() is not None:
+                self.root.after(0, lambda: self.status_label.config(text="Status: Capture device error / failed to start", fg="#e74c3c"))
+                return
+            self.root.after(0, lambda: self.status_label.config(text="Status: Live Preview (Ready)", fg="#2ecc71"))
+            self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
         except Exception as e:
-            if self._audio_sock:
-                try:
-                    self._audio_sock.close()
-                except Exception:
-                    pass
-                self._audio_sock = None
-            messagebox.showerror("Error", f"Failed to start FFmpeg:\n{e}")
-            self.stop_capture()
+            err = str(e)
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to start capture: {err}"))
 
-    def _audio_receiver_worker(self, sock):
-        """Receives live PCM chunks over UDP and feeds the native Windows soundcard."""
-        self.audio_player.start()
-
-        while self.running:
-            try:
-                data, _ = sock.recvfrom(8192)
-                if data:
-                    self.audio_player.write_chunk(data)
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-
+    def _drain_stderr(self, pipe):
         try:
-            sock.close()
-        except Exception:
-            pass
-        self._audio_sock = None
-        self.audio_player.stop()
+            for line in iter(pipe.readline, b""):
+                if any(k in line.decode("utf-8", errors="ignore").lower() for k in ("error", "fail")):
+                    print(f"[FFmpeg] {line.decode().strip()}", flush=True)
+        except Exception: pass
 
     def _pipe_reader_worker(self):
-        """Continuously pulls video frames at full 29.97 FPS."""
-        pipe = self.process.stdout if self.process else None
-        buf = bytearray(PREVIEW_FRAME_SIZE)
-        view = memoryview(buf)
-
-        while self.running:
-            if not pipe:
-                break
-
-            received = 0
-            while received < PREVIEW_FRAME_SIZE and self.running:
-                try:
-                    n = pipe.readinto(view[received:])
-                    if not n:
-                        break
-                    received += n
-                except Exception:
-                    break
-
-            if received < PREVIEW_FRAME_SIZE:
-                break
-
-            with self._frame_lock:
-                self._frame_queue.append(bytes(buf))
-                if not self._render_scheduled:
-                    self._render_scheduled = True
-                    self.root.after(0, self._render_frame)
-
-        if not self._stopping and self.process is not None:
-            self._had_error = True
-            self.root.after(0, self.handle_unexpected_exit)
-
-    def _render_frame(self):
-        """In-place buffer update on persistent PhotoImage (no GDI recreation)."""
-        try:
-            if not self.running or not self.canvas.winfo_exists():
-                return
-        except tk.TclError:
-            return
-
-        frame_data = None
-        with self._frame_lock:
-            self._render_scheduled = False
-            if self._frame_queue:
-                frame_data = self._frame_queue.pop()
-                self._frame_queue.clear()
-
-        if frame_data and self._current_photo is not None:
+        while not self._is_closing and self.process:
             try:
-                img = Image.frombuffer("RGB", (PREVIEW_WIDTH, PREVIEW_HEIGHT), frame_data, "raw", "RGB", 0, 1)
-                self._current_photo.paste(img)
+                frame = self.process.stdout.read(FRAME_SZ)
+                if len(frame) < FRAME_SZ: break
+                with self._frame_lock: self._frame_queue.append(frame)
+            except Exception: break
 
-                if "RECORDING" not in self.status_label.cget("text"):
-                    self.status_label.config(
-                        text=f"Status: RECORDING ({self.current_output})...", 
-                        fg="#2ecc71"
-                    )
-            except Exception:
-                pass
+    def _audio_receiver_worker(self):
+        self.audio_player.start()
+        while not self._is_closing and self.process:
+            try:
+                self._audio_conn, _ = self._audio_sock.accept()
+                self._audio_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self._audio_conn.settimeout(0.2)
+                break
+            except socket.timeout:
+                continue
+            except OSError:
+                break
 
-    def handle_unexpected_exit(self):
-        if self._stopping:
-            return
-        messagebox.showwarning("Stream Interrupted", "FFmpeg process ended unexpectedly or device was disconnected.")
-        self.stop_capture()
+        while not self._is_closing and self.process and self._audio_conn:
+            try:
+                data = self._audio_conn.recv(65536)
+                if not data:
+                    break
+                self.audio_player.write(data)
+            except (socket.timeout, OSError):
+                if self._is_closing: break
+        self.audio_player.stop()
 
-    def stop_capture(self, is_closing=False):
-        if (not self.running and self.process is None) or self._stopping:
-            return
+    def _rec_receiver_worker(self):
+        while not self._is_closing and self.process:
+            try:
+                self._rec_conn, _ = self._rec_sock.accept()
+                self._rec_conn.settimeout(0.2)
+                break
+            except socket.timeout:
+                continue
+            except OSError:
+                break
 
-        self._stopping = True
-        self.running = False
-        self._is_closing = is_closing
-        self.status_label.config(text="Status: Stopping & finalizing recording...", fg="#f39c12")
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.DISABLED)
+        while not self._is_closing and self._rec_conn:
+            try:
+                data = self._rec_conn.recv(65536)
+                if not data:
+                    break
+                with self._rec_lock:
+                    if self.is_recording and self._rec_file:
+                        self._rec_file.write(data)
+            except (socket.timeout, OSError):
+                if self._is_closing: break
 
-        def async_teardown():
-            proc = self.process
-            if proc:
-                if proc.stdin:
-                    try:
-                        proc.stdin.write(b'q\n')
-                        proc.stdin.flush()
-                        proc.stdin.close()
-                    except (BrokenPipeError, OSError):
-                        pass
-
-                try:
-                    proc.wait(timeout=4)
-                except subprocess.TimeoutExpired:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                except Exception:
-                    pass
-
-                for p in [proc.stdout, proc.stdin]:
-                    if p:
-                        try:
-                            p.close()
-                        except Exception:
-                            pass
-
-                self.process = None
-
-            if self.preview_thread and self.preview_thread.is_alive():
-                self.preview_thread.join(timeout=2)
-
-            if self.audio_thread and self.audio_thread.is_alive():
-                self.audio_thread.join(timeout=2)
-
-            # Post-processing: Remove trailing driver buzz & fade to silence
-            if self._temp_output and os.path.exists(self._temp_output):
-                if os.path.getsize(self._temp_output) > 0:
-                    try:
-                        kw = {
-                            "stdout": subprocess.PIPE,
-                            "stderr": subprocess.PIPE,
-                            "text": True,
-                            "encoding": "utf-8",
-                            "errors": "ignore"
-                        }
-                        if sys.platform == "win32":
-                            kw["creationflags"] = 0x08000000
-
-                        total_dur = get_media_duration(self._temp_output)
-
-                        if total_dur and total_dur > 0.5:
-                            if total_dur > 2.0:
-                                TRIM_TAIL = 0.750
-                                FADE_DUR = 0.250
-                            else:
-                                TRIM_TAIL = total_dur * 0.35
-                                FADE_DUR = total_dur * 0.15
-
-                            target_dur = max(0.1, total_dur - TRIM_TAIL)
-                            fade_start = max(0.0, target_dur - FADE_DUR)
-
-                            trim_cmd = [
-                                "ffmpeg", "-y", "-i", self._temp_output,
-                                "-t", f"{target_dur:.4f}",
-                                "-c:v", "copy",
-                                "-af", f"afade=t=out:st={fade_start:.4f}:d={FADE_DUR:.4f}",
-                                "-c:a", "ac3", "-b:a", "384k", "-ar", "48000",
-                                "-f", "vob", self.current_output
-                            ]
-                            trim_proc = subprocess.run(trim_cmd, **kw)
-
-                            if trim_proc.returncode == 0 and os.path.exists(self.current_output) and os.path.getsize(self.current_output) > 0:
-                                safe_remove_file(self._temp_output)
-                            else:
-                                os.replace(self._temp_output, self.current_output)
-                        else:
-                            os.replace(self._temp_output, self.current_output)
-
-                    except Exception:
-                        if os.path.exists(self._temp_output):
-                            os.replace(self._temp_output, self.current_output)
-                else:
-                    safe_remove_file(self._temp_output)
-
-            self.root.after(0, self.safe_finalize_stop)
-
-        threading.Thread(target=async_teardown, daemon=True).start()
-
-    def safe_finalize_stop(self):
+    def start_recording(self):
+        if not self.process or self.is_recording: return
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.current_output, self._temp_output = f"capture_{ts}.mpg", f"temp_{ts}.ts"
         try:
-            if self.root.winfo_exists():
-                self.finalize_stop()
-        except tk.TclError:
-            pass
+            f = open(self._temp_output, "wb")
+            with self._rec_lock: self._rec_file, self.is_recording = f, True
+            self.start_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.NORMAL)
+            self.status_label.config(text=f"Status: RECORDING ({self.current_output})...", fg="#e74c3c")
+        except Exception as e: messagebox.showerror("Error", f"Could not create file: {e}")
 
-    def finalize_stop(self):
-        self.canvas.delete("all")
-        self.image_item = None
-        self._current_photo = None
-        self._render_scheduled = False
-        with self._frame_lock:
-            self._frame_queue.clear()
-
+    def stop_recording(self):
+        if not self.is_recording: return
+        with self._rec_lock:
+            self.is_recording = False
+            f, self._rec_file = self._rec_file, None
+        if f:
+            try: f.close()
+            except Exception: pass
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self._stopping = False
+        self.status_label.config(text="Status: Live Preview (Finalizing file...)", fg="#3498db")
+        threading.Thread(target=self._finalize_file, args=(self._temp_output, self.current_output), daemon=True).start()
 
-        if self._had_error:
-            self.status_label.config(text="Status: Stopped with Error / Interrupted", fg="#e74c3c")
-        else:
-            self.status_label.config(text="Status: Finished / Ready", fg="black")
-            if not self._is_closing:
-                filename = self.current_output if self.current_output else "output.mpg"
-                messagebox.showinfo("Success", f"Recording finished completely!\nYour file '{filename}' is ready.")
+    def _finalize_file(self, temp_out, final_out):
+        cmd = ["ffmpeg", "-y", "-fflags", "+discardcorrupt+genpts", "-i", temp_out, "-map", "0:v:0", "-map", "0:a:0",
+               "-c:v", "mpeg2video", "-aspect", "4:3", "-pix_fmt", "yuv420p", "-b:v", "8800k", "-minrate", "8000k", "-maxrate", "9000k",
+               "-bufsize", "1835k", "-g", "15", "-bf", "2", "-flags", "+ilme+ildct", "-af", "aresample=async=1", "-c:a", "ac3", "-b:a", "448k",
+               "-ar", "48000", "-avoid_negative_ts", "make_zero", "-f", "dvd", final_out]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WIN)
+            if os.path.exists(final_out) and os.path.getsize(final_out) > 10000:
+                if os.path.exists(temp_out): os.remove(temp_out)
+            elif os.path.exists(temp_out): os.replace(temp_out, final_out)
+        except Exception:
+            if os.path.exists(temp_out): os.replace(temp_out, final_out)
+        if not self.is_recording:
+            self.root.after(0, lambda: self.status_label.config(text=f"Status: Live Preview (Saved '{final_out}')", fg="#2ecc71"))
 
     def on_closing(self):
-        if self.running or self._stopping or self.process is not None:
-            if self._stopping:
-                self.wait_for_shutdown()
-                return
-            if messagebox.askokcancel("Quit", "A recording is in progress.\nDo you want to stop recording and exit?"):
-                self.stop_capture(is_closing=True)
-                self.wait_for_shutdown()
-        else:
-            self.audio_player.stop()
-            self.root.destroy()
-
-    def wait_for_shutdown(self):
-        if self.process is not None or self._stopping:
-            self.root.after(100, self.wait_for_shutdown)
-        else:
-            self.audio_player.stop()
-            try:
-                self.root.destroy()
-            except tk.TclError:
-                pass
+        self._is_closing = True
+        with self._rec_lock:
+            if self._rec_file:
+                try: self._rec_file.close()
+                except Exception: pass
+        if self.process:
+            try: self.process.kill()
+            except Exception: pass
+        for conn in (self._audio_conn, self._rec_conn):
+            if conn:
+                try: conn.close()
+                except Exception: pass
+        for s in (self._audio_sock, self._rec_sock):
+            if s:
+                try: s.close()
+                except Exception: pass
+        self.audio_player.stop()
+        self.root.destroy()
 
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = GVUSB2CaptureGUI(root)
+    app = DVDRecorderGUI(root)
     root.mainloop()
