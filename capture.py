@@ -227,7 +227,7 @@ class DVDRecorderGUI:
             "-ac", "2", "-rtbufsize", "256M", "-i", f"audio={REQ_AUD}",
             "-filter_complex", (
                 f"[0:v]split=2[rec_v][prev_v];"
-                f"[rec_v]setfield=tff,hqdn3d=1.5:1.5:3:3[out_rec_v];"
+                f"[rec_v]setfield=tff[out_rec_v];"
                 f"[prev_v]setfield=tff,bwdif=mode=0:parity=0:deint=0,scale={PREV_W}:{PREV_H}:flags=fast_bilinear,format=rgb24[out_prev_v];"
                 f"[1:a]asplit=2[rec_a_in][prev_a_in];"
                 f"[rec_a_in]{rec_aud_f}[out_rec_a];"
