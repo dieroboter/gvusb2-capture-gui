@@ -240,7 +240,7 @@ class DVDRecorderGUI:
             "-map", "[out_rec_v]", "-map", "[out_rec_a]",
             "-c:v", "mpeg2video", "-b:v", "7500k", "-maxrate", "9000k", "-bufsize", "3670k",
             "-g", "12", "-bf", "0",
-            "-qmin", "2", "-qmax", "8", "-intra_dc_precision", "2",
+            "-qmin", "2", "-qmax", "12", "-intra_dc_precision", "2",
             "-flags:v", "+ilme+ildct",
             "-aspect", "4:3", "-pix_fmt", "yuv420p",
             "-c:a", "ac3", "-b:a", "448k", "-ar", "48000",
