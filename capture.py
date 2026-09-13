@@ -182,12 +182,27 @@ class DVDRecorderGUI:
         return s, s.getsockname()[1]
 
     @staticmethod
-    def _audio_filter_expr(delay_ms):
-        try: d = int(delay_ms)
-        except Exception: d = 0
-        if d > 0: return f"adelay={d}|{d},aresample=async=1000:first_pts=0"
-        if d < 0: return f"atrim=start={abs(d)/1000.0},asetpts=PTS-STARTPTS,aresample=async=1000:first_pts=0"
-        return "aresample=async=1000:first_pts=0"
+    def _audio_filter_expr(delay_ms, for_preview=False):
+        try:
+            d = int(delay_ms)
+        except Exception:
+            d = 0
+
+        if for_preview:
+            # For live preview: generate continuous monotonic PTS from sample counts
+            # This completely prevents dropouts after 36-40 minutes.
+            if d > 0:
+                return f"adelay={d}|{d},asetpts=N/SR/TB"
+            if d < 0:
+                return f"atrim=start={abs(d)/1000.0},asetpts=N/SR/TB"
+            return "asetpts=N/SR/TB"
+        else:
+            # For recording (MPEG-TS/DVD):
+            if d > 0:
+                return f"adelay={d}|{d},aresample=async=1:first_pts=0"
+            if d < 0:
+                return f"atrim=start={abs(d)/1000.0},asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
+            return "aresample=async=1:first_pts=0"
 
     def _get_seek_offset(self, filepath):
         def _get_pts(cmd, keyframe_only=False):
@@ -216,14 +231,14 @@ class DVDRecorderGUI:
         except Exception as e:
             return self.root.after(0, lambda: messagebox.showerror("Error", f"Socket allocation failed: {e}"))
 
-        prev_aud_f = self._audio_filter_expr(PREV_AUD_DELAY)
-        rec_aud_f = self._audio_filter_expr(REC_AUD_DELAY)
+        prev_aud_f = self._audio_filter_expr(PREV_AUD_DELAY, for_preview=True)
+        rec_aud_f = self._audio_filter_expr(REC_AUD_DELAY, for_preview=False)
 
         cmd = [
             "ffmpeg", "-y", "-fflags", "nobuffer", "-thread_queue_size", "1024",
             "-f", "dshow", "-video_size", f"{CAP_W}x{CAP_H}", "-framerate", "29.97",
             "-pixel_format", "yuyv422", "-rtbufsize", "256M", "-i", f"video={REQ_VID}",
-            "-thread_queue_size", "1024", "-f", "dshow", "-guess_layout_max", "0",
+            "-thread_queue_size", "1024", "-use_wallclock_as_timestamps", "1", "-f", "dshow", "-guess_layout_max", "0",
             "-ac", "2", "-rtbufsize", "256M", "-i", f"audio={REQ_AUD}",
             "-filter_complex", (
                 f"[0:v]split=2[rec_v][prev_v];"
