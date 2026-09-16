@@ -242,8 +242,8 @@ class DVDRecorderGUI:
             "-ac", "2", "-rtbufsize", "256M", "-i", f"audio={REQ_AUD}",
             "-filter_complex", (
                 f"[0:v]split=2[rec_v][prev_v];"
-                f"[rec_v]setfield=tff[out_rec_v];"
-                f"[prev_v]setfield=tff,bwdif=mode=0:parity=0:deint=0,scale={PREV_W}:{PREV_H}:flags=fast_bilinear,format=rgb24[out_prev_v];"
+                f"[rec_v]setfield=tff,setpts=PTS-STARTPTS[out_rec_v];"
+                f"[prev_v]setfield=tff,bwdif=mode=0:parity=0:deint=0,scale={PREV_W}:{PREV_H}:flags=fast_bilinear,format=rgb24,setpts=N/FRAME_RATE/TB[out_prev_v];"
                 f"[1:a]asplit=2[rec_a_in][prev_a_in];"
                 f"[rec_a_in]{rec_aud_f}[out_rec_a];"
                 f"[prev_a_in]{prev_aud_f}[out_prev_a]"
@@ -384,7 +384,7 @@ class DVDRecorderGUI:
         if target_duration is not None:
             cmd.extend(["-t", str(target_duration)])
         cmd.extend([
-            "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy", "-c:a", "ac3", "-b:a", "448k", "-ar", "48000",
+            "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy", "-c:a", "copy", "-b:a", "448k", "-ar", "48000",
             "-avoid_negative_ts", "make_zero", "-f", "dvd", final_out
         ])
         try:
