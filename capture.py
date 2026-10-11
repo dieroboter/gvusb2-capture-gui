@@ -18,7 +18,7 @@ def verify_devices():
 	if missing:return False,"The required inputs weren't found:\n\n"+'\n'.join(missing)+'\n\nPlease connect the I-O Data GV-USB2 and try again.'
 	return True,''
 class LiveAudioPlayer:
-	def __init__(self,sample_rate=48000,channels=2,blocksize=1024):self.sr,self.ch,self.blocksize,self.bps=sample_rate,channels,blocksize,2*channels;self.stream,self.running,self.buffer,self.started,self._lock=None,False,bytearray(),False,threading.Lock();self.prebuf,self.max_buf,self.tgt_buf=int(self.sr*self.bps*.06),int(self.sr*self.bps*.28),int(self.sr*self.bps*.12)
+	def __init__(self,sample_rate=48000,channels=2,blocksize=1024):self.sr,self.ch,self.blocksize,self.bps=sample_rate,channels,blocksize,2*channels;self.stream,self.running,self.buffer,self.started,self._lock=None,False,bytearray(),False,threading.Lock();self.prebuf,self.max_buf,self.tgt_buf=int(self.sr*self.bps*.4),int(self.sr*self.bps*.8),int(self.sr*self.bps*.4)
 	def _callback(self,outdata,frames,time_info,status):
 		req=frames*self.bps
 		with self._lock:
@@ -80,9 +80,9 @@ class DVDRecorderGUI:
 			if d<0:return f"atrim=start={abs(d)/1e3},asetpts=N/SR/TB"
 			return'asetpts=N/SR/TB'
 		else:
-			if d>0:return f"adelay={d}|{d},aresample=async=1:first_pts=0"
-			if d<0:return f"atrim=start={abs(d)/1e3},asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
-			return'aresample=async=1:first_pts=0'
+			if d>0:return f"adelay={d}|{d},asetpts=PTS-STARTPTS"
+			if d<0:return f"atrim=start={abs(d)/1e3},asetpts=PTS-STARTPTS"
+			return'asetpts=PTS-STARTPTS'
 	def _get_seek_offset(self,filepath):
 		def _get_pts(cmd,keyframe_only=False):
 			proc=None
@@ -185,7 +185,7 @@ class DVDRecorderGUI:
 	def _finalize_file(self,temp_out,final_out,target_duration=None):
 		seek=self._get_seek_offset(temp_out);cmd=['ffmpeg','-y','-fflags','+discardcorrupt+genpts','-ss',str(seek),'-i',temp_out]
 		if target_duration is not None:cmd.extend(['-t',str(target_duration)])
-		cmd.extend(['-map','0:v:0','-map','0:a:0','-c:v','copy','-c:a','copy','-avoid_negative_ts','make_zero','-f','dvd',final_out])
+		cmd.extend(['-map','0:v:0','-map','0:a:0','-c:v','copy','-c:a','copy','-avoid_negative_ts','make_zero','-f','vob',final_out])
 		try:
 			proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,creationflags=NO_WIN)
 			if proc.returncode!=0:print(f"[Finalize Error] {proc.stderr}",flush=True)
